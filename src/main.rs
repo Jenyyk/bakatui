@@ -23,7 +23,13 @@ struct Cache {
 }
 
 struct Extra {
-    timetable_sender: Sender<Timetable>,
+    frontend_sender: Sender<FrontendCommand>,
+}
+
+enum FrontendCommand {
+    TimetableData(Timetable),
+    Log(String),
+    Quit,
 }
 
 #[tokio::main]
@@ -35,7 +41,7 @@ async fn main() {
     let mut persistent = Persistent::load_or_create();
     persistent.config.refresh_token = None;
 
-    let (ttx, trx): (Sender<Timetable>, Receiver<Timetable>) = mpsc::channel();
+    let (ttx, trx): (Sender<FrontendCommand>, Receiver<FrontendCommand>) = mpsc::channel();
     let (btx, brx): (Sender<BackendCommand>, Receiver<BackendCommand>) = mpsc::channel();
 
     ensure_config_filled_from_user(&mut persistent.config);
@@ -47,10 +53,32 @@ async fn main() {
 
     if let Ok(timetable_json) = serde_json::from_str(&persistent.cache.timetable_data) {
         let timetable = Timetable::from_json(timetable_json);
-        let _ = ttx.send(timetable);
+        let _ = ttx.send(FrontendCommand::TimetableData(timetable));
     }
 
-    let access_token = get_access_token(&mut persistent.config).await.unwrap();
+    let access_token = match get_access_token(&mut persistent.config).await {
+        Ok(token) => token,
+        Err(err) => {
+            match err {
+                LoginError::Other(msg) => {
+                    let _ = ttx.send(FrontendCommand::Log(format!(
+                        "Login failed with unknown error, backend thread exiting. Error: {}",
+                        msg
+                    )));
+                    panic!();
+                }
+                LoginError::BadLogin => {
+                    let _ = ttx.send(FrontendCommand::Log("Login failed due to wrong credentials, please relaunch app and log in again".into()));
+                    persistent.config.password = "".into();
+                    persistent.config.user = "".into();
+                    persistent.config.url = "".into();
+                    persistent.config.refresh_token = None;
+                    let _ = persistent.save();
+                    panic!();
+                }
+            }
+        }
+    };
     let timetable_json = get_timetable(
         &persistent.config,
         access_token,
@@ -68,10 +96,10 @@ async fn main() {
 
     let timetable = Timetable::from_json(timetable_json);
 
-    let _ = ttx.send(timetable);
+    let _ = ttx.send(FrontendCommand::TimetableData(timetable));
 
     let mut extra = Extra {
-        timetable_sender: ttx,
+        frontend_sender: ttx,
     };
 
     loop {
@@ -88,7 +116,7 @@ async fn main() {
 /// attempts to get an access token
 ///
 /// if the attempt was made with an invalid refresh token, it will refresh the refresh token
-async fn get_access_token(config: &mut Config) -> Result<String, Box<dyn std::error::Error>> {
+async fn get_access_token(config: &mut Config) -> Result<String, LoginError> {
     let body = match &config.refresh_token {
         Some(token) => format!(
             "client_id=ANDR&grant_type=refresh_token&refresh_token={}",
@@ -125,10 +153,23 @@ async fn get_access_token(config: &mut Config) -> Result<String, Box<dyn std::er
             config.refresh_token = None;
             return Box::pin(get_access_token(config)).await;
         }
-        return Err(format!("Unexpected error while logging in: {:?}", err_json).into());
+        return Err(LoginError::BadLogin);
     }
 
-    Err(format!("Unexpected error while logging in: {:?}", response).into())
+    Err(LoginError::Other(format!(
+        "Unexpected error while logging in: {:?}",
+        response
+    )))
+}
+#[derive(Debug)]
+enum LoginError {
+    Other(String),
+    BadLogin,
+}
+impl From<reqwest::Error> for LoginError {
+    fn from(err: reqwest::Error) -> Self {
+        LoginError::Other(err.to_string())
+    }
 }
 
 async fn get_timetable(
@@ -222,7 +263,9 @@ async fn handle_backend_command(
                 persistent.cache.timetable_data = timetable_json.to_string();
             }
             let timetable: Timetable = Timetable::from_json(timetable_json);
-            let _ = extra.timetable_sender.send(timetable);
+            let _ = extra
+                .frontend_sender
+                .send(FrontendCommand::TimetableData(timetable));
         }
         BackendCommand::Quit => unreachable!(),
     }

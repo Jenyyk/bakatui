@@ -39,9 +39,10 @@ pub enum BackendCommand {
     RefreshTimetable(i64),
     Quit,
 }
+use crate::FrontendCommand;
 
 pub async fn tui_loop(
-    timetable_receiver: Receiver<Timetable>,
+    timetable_receiver: Receiver<FrontendCommand>,
     backend_sender: Sender<BackendCommand>,
 ) -> Result<(), std::io::Error> {
     let mut stdout = std::io::stdout();
@@ -49,7 +50,10 @@ pub async fn tui_loop(
         .recv()
         .expect("Initial timetable receive failed");
     let mut meta = Meta {
-        stored_tb: init_tb,
+        stored_tb: match init_tb {
+            FrontendCommand::TimetableData(tb) => tb,
+            _ => panic!("First frontend command was not timetable data"),
+        },
         backend_sender,
         ..Default::default()
     };
@@ -58,7 +62,7 @@ pub async fn tui_loop(
     enable_raw_mode()?;
     execute!(stdout, EnterAlternateScreen, cursor::Hide)?;
 
-    bottom_log(&mut stdout, &meta, "Init completed")?;
+    bottom_debug(&mut stdout, &meta, "Init completed")?;
     stdout.flush()?;
 
     loop {
@@ -89,16 +93,20 @@ pub async fn tui_loop(
         if poll(std::time::Duration::from_millis(500))?
             && let Event::Key(key) = read().unwrap()
         {
-            bottom_log(&mut stdout, &meta, format!("{:?}", key))?;
+            bottom_debug(&mut stdout, &meta, format!("{:?}", key))?;
             if handle_key(key, &mut meta).is_err() {
                 // this indicates a quit action
                 return Ok(());
             };
         }
 
-        // check for new timetables
-        if let Ok(tb) = timetable_receiver.try_recv() {
-            meta.stored_tb = tb;
+        // check for new commands
+        while let Ok(cmd) = timetable_receiver.try_recv() {
+            match cmd {
+                FrontendCommand::TimetableData(tb) => meta.stored_tb = tb,
+                FrontendCommand::Log(msg) => bottom_log(&mut stdout, &meta, msg)?,
+                FrontendCommand::Quit => gracefully_quit(&meta),
+            };
         }
     }
 }
@@ -133,9 +141,6 @@ fn bottom_log(
     meta: &Meta,
     message: impl Into<String>,
 ) -> Result<(), std::io::Error> {
-    if std::env::var("DEBUG").is_err() {
-        return Ok(());
-    }
     let old_pos = cursor::position()?;
     queue!(
         stdout,
@@ -146,6 +151,17 @@ fn bottom_log(
     )?;
 
     Ok(())
+}
+
+fn bottom_debug(
+    stdout: &mut std::io::Stdout,
+    meta: &Meta,
+    message: impl Into<String>,
+) -> Result<(), std::io::Error> {
+    if std::env::var("DEBUG").is_err() {
+        return Ok(());
+    }
+    bottom_log(stdout, meta, message)
 }
 
 fn handle_key(key: KeyEvent, meta: &mut Meta) -> Result<(), ()> {
@@ -349,7 +365,6 @@ fn queue_clear_down_except_last() -> Result<(), std::io::Error> {
 }
 
 fn refresh_timetable(meta: &mut Meta) {
-    meta.backend_sender
-        .send(BackendCommand::RefreshTimetable(meta.week_modifier))
-        .unwrap();
+    let _ = meta.backend_sender
+        .send(BackendCommand::RefreshTimetable(meta.week_modifier));
 }
