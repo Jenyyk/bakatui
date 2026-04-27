@@ -68,7 +68,7 @@ async fn main() {
                     panic!();
                 }
                 LoginError::BadLogin => {
-                    let _ = ttx.send(FrontendCommand::Log("Login failed due to wrong credentials, please relaunch app and log in again".into()));
+                    let _ = ttx.send(FrontendCommand::Log("Špatné přihlašovací údaje, prosím restartuj aplikaci".into()));
                     persistent.config.password = "".into();
                     persistent.config.user = "".into();
                     persistent.config.url = "".into();

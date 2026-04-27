@@ -32,6 +32,9 @@ struct Meta {
     week_modifier: i64,
 
     backend_sender: Sender<BackendCommand>,
+
+    from_cache: bool,
+    waiting_on_data: bool,
 }
 
 pub enum BackendCommand {
@@ -74,13 +77,19 @@ pub async fn tui_loop(
             stdout,
             Clear(ClearType::CurrentLine),
             Print(format!(
-                "Týden: {}",
+                "Týden: {} {}",
                 match meta.week_modifier {
                     ..-1 => meta.week_modifier.to_string(),
                     -1 => "minulý".into(),
                     0 => "tento".into(),
                     1 => "příští".into(),
                     _ => format!("+{}", meta.week_modifier),
+                },
+                match (meta.from_cache, meta.waiting_on_data) {
+                    (true, true) => "(z paměti, možná zastaralé + načítám něco)",
+                    (true, false) => "(z paměti, možná zastaralé)",
+                    (false, true) => "(načítám)",
+                    (false, false) => "",
                 }
             )),
             cursor::MoveToNextLine(1)
@@ -103,7 +112,14 @@ pub async fn tui_loop(
         // check for new commands
         while let Ok(cmd) = timetable_receiver.try_recv() {
             match cmd {
-                FrontendCommand::TimetableData(tb) => meta.stored_tb = tb,
+                FrontendCommand::TimetableData(tb) => {
+                    if meta.from_cache {
+                        meta.from_cache = false;
+                    } else {
+                        meta.waiting_on_data = false;
+                    }
+                    meta.stored_tb = tb;
+                },
                 FrontendCommand::Log(msg) => bottom_log(&mut stdout, &meta, msg)?,
                 FrontendCommand::Quit => gracefully_quit(&meta),
             };
@@ -248,6 +264,8 @@ impl Default for Meta {
             week_modifier: 0,
             stored_tb: Timetable::default(),
             backend_sender: std::sync::mpsc::channel().0,
+            waiting_on_data: false,
+            from_cache: true,
         }
     }
 }
@@ -365,6 +383,7 @@ fn queue_clear_down_except_last() -> Result<(), std::io::Error> {
 }
 
 fn refresh_timetable(meta: &mut Meta) {
+    meta.waiting_on_data = true;
     let _ = meta.backend_sender
         .send(BackendCommand::RefreshTimetable(meta.week_modifier));
 }
